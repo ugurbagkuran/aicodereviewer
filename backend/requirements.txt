@@ -45,3 +45,6 @@ httpx>=0.27.0,<1.0.0
 
 # --- WebSocket ---
 websockets>=12.0,<14.0
+
+# --- Kubernetes ---
+kubernetes>=28.1.0,<30.0.0

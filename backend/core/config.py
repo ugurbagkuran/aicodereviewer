@@ -53,13 +53,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     USE_REDIS: bool = False
 
-    # ── OpenRouter (AI Model) ────────────────────────
-    OPENROUTER_API_KEY: str = ""
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    AI_MODEL: str = "google/gemma-4-27b-it"
-
-    # ── Google Embedding ─────────────────────────────
+    # ── Google AI Studio (Model & Embedding) ─────────
     GOOGLE_API_KEY: str = ""
+    AI_MODEL: str = "gemini-1.5-pro-latest"
     EMBEDDING_MODEL: str = "text-embedding-004"
 
     # ── Qdrant ───────────────────────────────────────
