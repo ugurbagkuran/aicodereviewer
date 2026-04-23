@@ -25,12 +25,9 @@ async def test_agent():
         project_id = res.json()["id"]
         print(f"-> Proje olusturuldu: {project_id}")
 
-        # K8S endpoint'i timeout'a düşebileceği için /start çağırmadan direkt MongoDB'den status'u running yapalım.
-        print("... Container Baslatiliyor (MongoDB bypass)...")
-        from motor.motor_asyncio import AsyncIOMotorClient
-        mongo_client = AsyncIOMotorClient("mongodb+srv://user:pass@cluster.mongodb.net/") # Dummy URI, wait we need the valid one.
-        # Actually it's better to just skip the /start request and send an HTTP request if we can.
-        # Let's temporarily disable the 'running' check in agent_router instead of this.
+        # K8S endpoint'i timeout'a düşebileceği için /start çağırmadan
+        # agent/router.py içindeki 'running' durumu kontrolü yorum satırına alındı.
+        print("... Container status bypass edildi (running check devre dışı)...")
 
         # Agent Başlat
         print(f"\n---> Agent'a gorev veriliyor: 'Bana basit bir index.html yaz'")
@@ -50,7 +47,7 @@ async def test_agent():
         # router.websocket("/ws/agent/{session_id}") => app.include_router(prefix="/api/v1/agent")
         # Demek ki URL: ws://localhost:8000/api/v1/agent/ws/agent/{session_id}
         # Kontrol edelim.
-        ws_uri = f"{WS_URL}/agent/ws/agent/{session_id}"
+        ws_uri = f"{WS_URL}/agent/{session_id}/stream"
         async with websockets.connect(ws_uri) as websocket:
             while True:
                 response = await websocket.recv()

@@ -61,8 +61,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     from auth.service import ensure_indexes as auth_ensure_indexes
     from projects.service import ensure_indexes as projects_ensure_indexes
 
-    await auth_ensure_indexes(db)
-    await projects_ensure_indexes(db)
+    try:
+        await auth_ensure_indexes(db)
+        await projects_ensure_indexes(db)
+    except Exception as e:
+        logger.error("index_creation_failed", error=str(e))
 
     # Idle pod checker background task
     from projects.service import idle_pod_checker

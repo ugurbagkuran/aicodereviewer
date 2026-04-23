@@ -92,6 +92,8 @@ def _should_continue(state: AgentState) -> str:
         "action"  → Devam et veya hata düzelt
         "summary_updater" → İş bitti, özetleri güncelle
     """
+    import json, re
+
     # Maksimum adım kontrolü
     current_step = state.get("current_step", 0)
     max_steps = state.get("max_steps", 25)
@@ -104,15 +106,57 @@ def _should_continue(state: AgentState) -> str:
         )
         return "summary_updater"
 
-    # Observer kararını kontrol et
+    # Observer kararını JSON parse ederek güvenilir şekilde oku
     observation = state.get("observation", "")
+    decision = "continue"  # varsayılan
 
-    if '"done"' in observation.lower():
+    try:
+        # Markdown code block içindeyse temizle
+        clean = observation.strip()
+        match = re.search(r"```(?:json)?\s*({.*?})\s*```", clean, re.DOTALL)
+        if match:
+            clean = match.group(1)
+        elif clean.startswith("{"):
+            pass  # Zaten düz JSON
+        else:
+            # Son çare: JSON bloğunu bul
+            match = re.search(r"{.*}", clean, re.DOTALL)
+            if match:
+                clean = match.group(0)
+
+        data = json.loads(clean)
+        # Bazen model "decision" dönmez, "tool" vs döner, yani action node sandığını sanar
+        if "decision" in data:
+            decision = data.get("decision", "continue").lower()
+        else:
+            # model yanılmış ve action dönmüş
+            obs_lower = observation.lower()
+            if "done" in obs_lower:
+                decision = "done"
+            else:
+                decision = "continue"
+
+    except (json.JSONDecodeError, AttributeError):
+        # Parse edilemezse raw string'e bak (geriye dönük uyumluluk)
+        obs_lower = observation.lower()
+        if "done" in obs_lower:
+            decision = "done"
+        elif "fix" in obs_lower:
+            decision = "fix"
+        else:
+            decision = "continue"
+
+    logger.debug(
+        "observer_decision",
+        project_id=state.get("project_id"),
+        decision=decision,
+        step=current_step,
+    )
+
+    if decision == "done":
         return "summary_updater"
-    elif '"continue"' in observation.lower() or '"fix"' in observation.lower():
-        return "action"
     else:
-        # Belirsiz durumda devam et (max_steps koruyacak)
+        # "continue" veya "fix" → action'a dön
         return "action"
 
 
@@ -164,14 +208,28 @@ def build_agent_graph() -> StateGraph:
 
 # Compiled graph (singleton)
 _compiled_graph = None
+_graph_lock = None
 
 
-def get_compiled_graph():
-    """Compiled graph instance'ını döndür (lazy init)."""
+async def _get_graph_lock():
+    """Asyncio lock'ı lazy olarak başlat."""
+    global _graph_lock
+    if _graph_lock is None:
+        import asyncio
+        _graph_lock = asyncio.Lock()
+    return _graph_lock
+
+
+async def get_compiled_graph():
+    """Compiled graph instance'ını döndür (async-safe lazy init)."""
     global _compiled_graph
-    if _compiled_graph is None:
-        graph = build_agent_graph()
-        _compiled_graph = graph.compile()
+    if _compiled_graph is not None:
+        return _compiled_graph
+    lock = await _get_graph_lock()
+    async with lock:
+        if _compiled_graph is None:  # double-check
+            graph = build_agent_graph()
+            _compiled_graph = graph.compile()
     return _compiled_graph
 
 
@@ -204,7 +262,7 @@ async def run_agent(
         Son agent state.
     """
     db = Database.get_db()
-    compiled = get_compiled_graph()
+    compiled = await get_compiled_graph()
 
     logger.info(
         "agent_run_start",
@@ -252,13 +310,27 @@ async def run_agent(
                     {"$push": {"steps": step_record}},
                 )
 
+                # Node'a göre doğru logu WebSocket'e gönderelim
+                # Observer ise observation'ı, değilse action'ı gösterelim
+                if node_name == "observer":
+                    # ÖNEMLİ: state.get() değil node_state.get() kullanıyoruz
+                    # Çünkü final_state eski "last_action" alanını ezmediği için karışıyor
+                    display_action = node_state.get("observation", final_state.get("observation", ""))
+                elif node_name == "planner":
+                    display_action = node_state.get("plan", final_state.get("plan", ""))
+                elif node_name == "context_builder":
+                    display_action = "Context oluşturuldu."
+                else: # action ve diğerleri
+                    # action_node, dict dönerken "last_action" key'ine kaydeder
+                    display_action = node_state.get("last_action", final_state.get("last_action", ""))
+
                 # Callback (WebSocket bildirimi)
                 if on_step_callback:
                     await on_step_callback({
                         "type": "step",
                         "step_no": step_record["step_no"],
                         "node": node_name,
-                        "action": final_state.get("last_action", "")[:200],
+                        "action": display_action[:500],  # Daha okunabilir olsun diye uzatıldı
                         "status": "success",
                     })
 

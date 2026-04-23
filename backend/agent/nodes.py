@@ -12,7 +12,6 @@ Her node, agent pipeline'ında bir adımdır:
 from datetime import datetime, timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 import structlog
 
 from agent.memory.file_tree import get_file_tree
@@ -22,16 +21,37 @@ from core.database import Database
 
 logger = structlog.get_logger(__name__)
 
+# LLM instance cache (modül başına bir kez oluştur)
+_llm_instance = None
 
-def _get_llm() -> ChatGoogleGenerativeAI:
-    """Google AI Studio üzerinden (Gemini vb.) model instance'ı."""
-    return ChatGoogleGenerativeAI(
+
+def _get_llm():
+    """
+    Google AI Studio üzerinden (Gemini vb.) model instance'ı.
+    """
+    global _llm_instance
+    if _llm_instance is not None:
+        return _llm_instance
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    _llm_instance = ChatGoogleGenerativeAI(
         model=settings.AI_MODEL,
         google_api_key=settings.GOOGLE_API_KEY,
         temperature=0.1,
         max_tokens=8192,
-        max_retries=2, # Yeni sürüm için explicitly tanımlandı
     )
+
+    return _llm_instance
+
+
+def _extract_text(content) -> str:
+    """
+    LLM çıktısını güvenli şekilde string'e çevirir.
+    'Thinking' modelleri liste formatında [{'type': 'thinking', ...}, {'type': 'text', 'text': '...'}] döner.
+    """
+    if isinstance(content, list):
+        return " ".join([c.get("text", "") if isinstance(c, dict) else str(c) for c in content])
+    return str(content)
 
 
 # ═══════════════════════════════════════════════════════
@@ -145,12 +165,13 @@ KULLANICI İSTEĞİ:
     ]
 
     response = await llm.ainvoke(messages)
+    content_str = _extract_text(response.content)
 
     return {
         **state,
-        "plan": response.content,
+        "plan": content_str,
         "messages": state.get("messages", []) + [
-            {"role": "assistant", "content": response.content, "node": "planner"}
+            {"role": "assistant", "content": content_str, "node": "planner"}
         ],
     }
 
@@ -199,20 +220,21 @@ Respond with a JSON:
     ]
 
     response = await llm.ainvoke(messages)
+    content_str = _extract_text(response.content)
 
     # Tool çağrısını gerçekleştir
     tool_result = await _execute_tool(
         state["project_id"],
-        response.content,
+        content_str,
     )
 
     return {
         **state,
         "current_step": step,
-        "last_action": response.content,
+        "last_action": content_str,
         "last_result": tool_result,
         "messages": state.get("messages", []) + [
-            {"role": "assistant", "content": response.content, "node": "action"},
+            {"role": "assistant", "content": content_str, "node": "action"},
             {"role": "tool", "content": tool_result, "node": "action"},
         ],
     }
@@ -251,26 +273,28 @@ Değerlendir:
 2. Plan tamamlandı mı?
 3. Bir sonraki adım ne olmalı?
 
-Respond with JSON:
+CEVABINI ZORUNLU OLARAK AŞAĞIDAKİ EXACT JSON FORMATINDA VER:
 {{
     "decision": "continue" | "fix" | "done",
-    "reasoning": "Kararın sebebi",
-    "error": null | "hata açıklaması"
+    "reasoning": "Plan başarıyla tamamlandı, bu yüzden done dönüyorum.",
+    "error": null
 }}
+Hiçbir tool, komut veya dosya yazma JSON'u DÖNDÜRME. Sistem şu an senin kod yazmanı DEĞİL, çalışmanı bitirip bitirmediğini puanlamanı bekliyor.
 """
 
     messages = [
-        SystemMessage(content="Bir kod agent'ının çıktısını değerlendiriyorsun. Mantıklı kararlar ver."),
+        SystemMessage(content="DİKKAT: Sen sadece bir denetçisin (OBSERVER). Kod yazmamalısın. Çıktın 'continue', 'fix' ya da 'done' seçeneklerinden birini içeren basit bir JSON olmalıdır."),
         HumanMessage(content=observe_prompt),
     ]
 
     response = await llm.ainvoke(messages)
+    content_str = _extract_text(response.content)
 
     return {
         **state,
-        "observation": response.content,
+        "observation": content_str,
         "messages": state.get("messages", []) + [
-            {"role": "assistant", "content": response.content, "node": "observer"}
+            {"role": "assistant", "content": content_str, "node": "observer"}
         ],
     }
 
@@ -319,12 +343,13 @@ Dosya: {file_path}
             response = await llm.ainvoke([
                 HumanMessage(content=summary_prompt)
             ])
+            content_str = _extract_text(response.content)
 
             await upsert_file_summary(
                 db=db,
                 project_id=state["project_id"],
                 file_path=file_path,
-                summary=response.content.strip(),
+                summary=content_str.strip(),
             )
 
         except Exception as e:
@@ -394,17 +419,23 @@ async def _execute_tool(project_id: str, llm_response: str) -> str:
             llm_response = " ".join([c.get("text", "") if isinstance(c, dict) else str(c) for c in llm_response])
 
         # JSON'u parse et (markdown code block içinde olabilir)
+        import re
         clean = llm_response.strip()
-        if "```" in clean:
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-            clean = clean.strip()
+
+        # Önce ```json ... ``` veya ``` ... ``` pattern'ini dene
+        match = re.search(r"```(?:json)?\s*({.*?})\s*```", clean, re.DOTALL)
+        if match:
+            clean = match.group(1).strip()
+        elif "{" in clean:
+            # Düz JSON bloğu bul
+            start = clean.index("{")
+            end = clean.rindex("}") + 1
+            clean = clean[start:end]
 
         data = json.loads(clean)
         tool_name = data.get("tool", "")
         args = data.get("args", {})
-    except (json.JSONDecodeError, IndexError, KeyError) as e:
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
         return f"Tool parse hatası: {e}. LLM çıktısı: {llm_response[:200]}"
 
     from sandbox.client import SandboxClient
@@ -429,7 +460,10 @@ async def _execute_tool(project_id: str, llm_response: str) -> str:
         elif tool_name == "list_files":
             result = await client.list_files(args.get("directory", "/"))
             files = result.get("files", [])
-            return "\n".join(f['name'] for f in files)
+            return "\n".join(
+                item.get("name", str(item)) if isinstance(item, dict) else str(item)
+                for item in files
+            )
 
         elif tool_name == "run_command":
             result = await client.exec_command(

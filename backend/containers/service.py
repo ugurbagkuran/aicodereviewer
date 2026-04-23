@@ -57,7 +57,10 @@ async def create_pod(
     
     if not core_v1:
         logger.error("k8s_client_not_initialized")
-        return {}
+        raise RuntimeError(
+            "Kubernetes client başlatılamadı. "
+            "Kubeconfig veya in-cluster config eksik."
+        )
 
     loop = asyncio.get_running_loop()
 
@@ -78,18 +81,38 @@ async def create_pod(
             name="app",
             image="node:18-alpine",
             command=["sh", "-c"],
-            args=["while true; do sleep 30; done;"], # İçeriği sidecar dolduracak/çalıştıracak
+            args=["while true; do sleep 30; done;"],  # İçeriği sidecar dolduracak/çalıştıracak
             volume_mounts=[client.V1VolumeMount(name="workspace", mount_path="/workspace")],
-            working_dir="/workspace"
+            working_dir="/workspace",
+            resources=client.V1ResourceRequirements(
+                requests={
+                    "cpu": settings.POD_CPU_REQUEST,
+                    "memory": settings.POD_MEMORY_REQUEST,
+                },
+                limits={
+                    "cpu": settings.POD_CPU_LIMIT,
+                    "memory": settings.POD_MEMORY_LIMIT,
+                },
+            ),
         )
-        
+
         # Sidecar API
         container_sidecar = client.V1Container(
             name="sidecar",
-            image="aicodereviewer-sidecar:latest", # Dockerfile build alınmalı
+            image="aicodereviewer-sidecar:latest",  # Dockerfile build alınmalı
             image_pull_policy="IfNotPresent",
             ports=[client.V1ContainerPort(container_port=8000)],
-            volume_mounts=[client.V1VolumeMount(name="workspace", mount_path="/workspace")]
+            volume_mounts=[client.V1VolumeMount(name="workspace", mount_path="/workspace")],
+            resources=client.V1ResourceRequirements(
+                requests={
+                    "cpu": settings.SIDECAR_CPU_REQUEST,
+                    "memory": settings.SIDECAR_MEMORY_REQUEST,
+                },
+                limits={
+                    "cpu": settings.SIDECAR_CPU_LIMIT,
+                    "memory": settings.SIDECAR_MEMORY_LIMIT,
+                },
+            ),
         )
         
         template = client.V1PodTemplateSpec(
@@ -168,7 +191,8 @@ async def create_pod(
                 
         return preview_host, deployment_name, service_name, ingress_name
 
-    preview_host, deployment_name, service_name, ingress_name = await loop.run_in_executor(None, _create_k8s_objects)
+    result_tuple = await loop.run_in_executor(None, _create_k8s_objects)
+    preview_host, deployment_name, service_name, ingress_name = result_tuple
 
     return {
         "namespace": namespace,
@@ -187,6 +211,7 @@ async def delete_pod(
     logger.info("delete_pod_k8s", project_id=project_id, namespace=namespace)
 
     if not core_v1:
+        logger.error("k8s_client_not_initialized")
         return False
 
     loop = asyncio.get_running_loop()
@@ -212,6 +237,7 @@ async def get_pod_status(
     logger.debug("get_pod_status_k8s", project_id=project_id, namespace=namespace)
 
     if not core_v1:
+        logger.warning("k8s_client_not_initialized_status_check")
         return "not_found"
 
     loop = asyncio.get_running_loop()

@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     AI_MODEL: str = "gemini-1.5-pro-latest"
     EMBEDDING_MODEL: str = "text-embedding-004"
 
+    # ── OpenRouter (Alternative AI Provider) ───────
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # AI_PROVIDER: "google" veya "openrouter"
+    AI_PROVIDER: str = "google"
+
     # ── Qdrant ───────────────────────────────────────
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333

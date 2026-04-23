@@ -228,13 +228,15 @@ async def get_session_steps_endpoint(
 # ═══════════════════════════════════════════════════════
 
 
-@router.websocket("/ws/agent/{session_id}")
+@router.websocket("/{session_id}/stream")
 async def agent_stream_ws(
     websocket: WebSocket,
     session_id: str,
 ) -> None:
     """
     Agent adım stream WebSocket'i.
+
+    URL: ws://host/api/v1/agent/{session_id}/stream
 
     Agent her adımda şu formatı gönderir:
     {
@@ -254,7 +256,7 @@ async def agent_stream_ws(
     await websocket.accept()
     logger.info("ws_agent_connected", session_id=session_id)
 
-    db = Database.get_db()
+    db = get_database()
 
     try:
         last_step_count = 0
@@ -308,13 +310,15 @@ async def agent_stream_ws(
             pass
 
 
-@router.websocket("/ws/logs/{project_id}")
+@router.websocket("/logs/{project_id}/stream")
 async def logs_stream_ws(
     websocket: WebSocket,
     project_id: str,
 ) -> None:
     """
     Container log stream WebSocket'i.
+
+    URL: ws://host/api/v1/agent/logs/{project_id}/stream
 
     Sidecar'ın /logs endpoint'ini sürekli poll ederek
     yeni logları WebSocket üzerinden iletir.

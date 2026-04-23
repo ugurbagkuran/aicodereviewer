@@ -208,3 +208,65 @@ async def stop_project_endpoint(
         project_id=project_id,
     )
     return project
+
+# ── DOSYA VE SIDECAR (SANDBOX) KÖPRÜSÜ ──
+
+from sandbox.client import SandboxClient
+from pydantic import BaseModel
+
+class WriteFileRequest(BaseModel):
+    path: str
+    content: str
+
+class ExecRequest(BaseModel):
+    command: str
+    timeout: int = 30
+
+@router.get("/{project_id}/files")
+async def list_project_files(
+    project_id: str,
+    path: str = "/",
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    client = SandboxClient(project_id)
+    return await client.list_files(path)
+
+@router.get("/{project_id}/files/read")
+async def read_project_file(
+    project_id: str,
+    path: str,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    client = SandboxClient(project_id)
+    return await client.read_file(path)
+
+@router.post("/{project_id}/files/write")
+async def write_project_file(
+    project_id: str,
+    data: WriteFileRequest,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    client = SandboxClient(project_id)
+    return await client.write_file(data.path, data.content)
+
+@router.delete("/{project_id}/files/delete")
+async def delete_project_file(
+    project_id: str,
+    path: str,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    client = SandboxClient(project_id)
+    return await client.delete_file(path)
+
+@router.post("/{project_id}/exec")
+async def exec_project_command(
+    project_id: str,
+    data: ExecRequest,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    client = SandboxClient(project_id)
+    return await client.exec_command(data.command, data.timeout)
+
+
+# -- DOSYA 0^LEMLER0 (SIDECAR PROXY) --
+

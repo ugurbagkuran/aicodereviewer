@@ -23,7 +23,6 @@ bcrypt>=4.2.0,<5.0.0
 # --- AI Agent (LangGraph + LangChain) ---
 langgraph>=0.2.0,<1.0.0
 langchain>=0.3.0,<1.0.0
-langchain-openai>=0.2.0,<1.0.0
 
 # --- Embedding (Google text-embedding-004) ---
 langchain-google-genai>=2.0.0,<3.0.0

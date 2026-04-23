@@ -133,16 +133,27 @@ async def exec_command(req: ExecRequest) -> Dict:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout, stderr = await process.communicate()
-        # Timeout mekanizmasını communicate üzerinde manuel kurmadık çünkü subprocess communicate
-        # await timeout ile çalıştırılabilir.
-        
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=req.timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise HTTPException(
+                status_code=408,
+                detail=f"Komut zaman aşımına uğradtı ({req.timeout}s): {req.command[:100]}",
+            )
+
         return {
             "command": req.command,
             "exit_code": process.returncode,
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace")
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
