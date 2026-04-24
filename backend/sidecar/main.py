@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Body
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="AI Code Reviewer Sidecar API")
@@ -55,6 +56,22 @@ def resolve_path(sandbox_path: str) -> Path:
         raise HTTPException(status_code=403, detail="Workspace dışına çıkılamaz.")
         
     return full_path
+
+
+@app.get("/", response_class=HTMLResponse)
+async def preview_root() -> HTMLResponse:
+    """Preview kök URL'inde workspace/index.html içeriğini servis et."""
+    index_file = Path(WORKSPACE_DIR) / "index.html"
+
+    if not index_file.exists() or not index_file.is_file():
+        raise HTTPException(status_code=404, detail="index.html bulunamadı")
+
+    try:
+        content = index_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="index.html UTF-8 olmalı")
+
+    return HTMLResponse(content=content)
 
 
 @app.get("/files")

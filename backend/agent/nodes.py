@@ -54,6 +54,105 @@ def _extract_text(content) -> str:
     return str(content)
 
 
+def _request_expects_html(user_request: str) -> bool:
+    """Kullanıcı isteğinde HTML/sayfa beklentisi var mı?"""
+    req = (user_request or "").lower()
+    keywords = ("html", "sayfa", "page", "web")
+    return any(k in req for k in keywords)
+
+
+def _extract_json_payload(raw: str) -> dict | None:
+    """LLM çıktısından JSON payload çıkarır."""
+    import json
+    import re
+
+    clean = (raw or "").strip()
+    if not clean:
+        return None
+
+    match = re.search(r"```(?:json)?\s*({.*?})\s*```", clean, re.DOTALL)
+    if match:
+        clean = match.group(1).strip()
+    elif "{" in clean and "}" in clean:
+        start = clean.index("{")
+        end = clean.rindex("}") + 1
+        clean = clean[start:end]
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
+
+
+def _looks_like_html(content: str) -> bool:
+    """İçeriğin HTML dokümanı gibi görünüp görünmediğini kontrol eder."""
+    lowered = (content or "").lower()
+    return "<!doctype html" in lowered or "<html" in lowered
+
+
+def _normalize_html_write_action(action_json: str, user_request: str) -> str:
+    """
+    HTML/sayfa isteklerinde *.html write_file içeriğini güvenli şekilde normalize et.
+    Model sadece düz metin üretirse tam HTML iskeleti içine sarar.
+    """
+    import html
+    import json
+
+    if not _request_expects_html(user_request):
+        return action_json
+
+    data = _extract_json_payload(action_json)
+    if not data:
+        return action_json
+
+    tool = (data.get("tool") or "").strip().lower()
+    args = data.get("args") or {}
+    path = str(args.get("path", "")).strip()
+
+    if tool != "write_file" or not path.lower().endswith(".html"):
+        return action_json
+
+    raw_content = str(args.get("content", ""))
+    if _looks_like_html(raw_content):
+        return action_json
+
+    heading_text = raw_content.strip() or "Hello World"
+    page_title = "Hello World" if "hello world" in (user_request or "").lower() else "Web Sayfasi"
+    safe_heading = html.escape(heading_text)
+    safe_title = html.escape(page_title)
+
+    args["content"] = (
+        "<!doctype html>\n"
+        "<html lang=\"tr\">\n"
+        "<head>\n"
+        "  <meta charset=\"UTF-8\" />\n"
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n"
+        f"  <title>{safe_title}</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"  <h1>{safe_heading}</h1>\n"
+        "</body>\n"
+        "</html>"
+    )
+
+    data["args"] = args
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _format_recent_action_trace(messages: list[dict]) -> str:
+    """Observer için son action/tool izini kısa formatta döndürür."""
+    lines = []
+    for msg in messages[-12:]:
+        if msg.get("node") != "action":
+            continue
+        role = msg.get("role", "")
+        if role not in ("assistant", "tool"):
+            continue
+        content = str(msg.get("content", ""))[:300]
+        lines.append(f"[{role}/action]: {content}")
+    return "\n".join(lines) if lines else "(yok)"
+
+
 # ═══════════════════════════════════════════════════════
 # NODE 1: CONTEXT BUILDER
 # ═══════════════════════════════════════════════════════
@@ -197,13 +296,27 @@ async def action_node(state: dict) -> dict:
     )
 
     llm = _get_llm()
+    user_request = state.get("user_request", "")
+    html_rule = ""
+    if _request_expects_html(user_request):
+        html_rule = """
+EK HTML KURALI (ZORUNLU):
+- *.html dosyasına yazarken content tam HTML dokümanı olmalı.
+- En az <!doctype html>, <html>, <head>, <body> etiketleri bulunmalı.
+- Sadece düz metin (ör. sadece 'Hello World') yazma.
+"""
 
     # Tool çağrısı için prompt
     action_prompt = f"""Mevcut adım: {step}
 Plan: {state.get('plan', '')}
 
+Kullanıcı isteği:
+{user_request}
+
 Önceki mesajlar:
 {_format_messages(state.get('messages', []))}
+
+{html_rule}
 
 Şimdi hangi aksiyonu alman gerekiyor? Tek bir tool çağrısı yap.
 Respond with a JSON:
@@ -215,26 +328,30 @@ Respond with a JSON:
 """
 
     messages = [
-        SystemMessage(content="Sen bir kod yazma agent'sın. Verilen plan doğrultusunda tek bir adım gerçekleştir."),
+        SystemMessage(content=(
+            "Sen bir kod yazma agent'sın. Verilen plan doğrultusunda tek bir adım gerçekleştir. "
+            "Tool JSON formatına kesinlikle uy. HTML/sayfa isteklerinde *.html içeriğini tam HTML dokümanı olarak üret."
+        )),
         HumanMessage(content=action_prompt),
     ]
 
     response = await llm.ainvoke(messages)
     content_str = _extract_text(response.content)
+    normalized_action = _normalize_html_write_action(content_str, user_request)
 
     # Tool çağrısını gerçekleştir
     tool_result = await _execute_tool(
         state["project_id"],
-        content_str,
+        normalized_action,
     )
 
     return {
         **state,
         "current_step": step,
-        "last_action": content_str,
+        "last_action": normalized_action,
         "last_result": tool_result,
         "messages": state.get("messages", []) + [
-            {"role": "assistant", "content": content_str, "node": "action"},
+            {"role": "assistant", "content": normalized_action, "node": "action"},
             {"role": "tool", "content": tool_result, "node": "action"},
         ],
     }
@@ -259,11 +376,15 @@ async def observer_node(state: dict) -> dict:
     )
 
     llm = _get_llm()
+    recent_trace = _format_recent_action_trace(state.get("messages", []))
 
     observe_prompt = f"""Son aksiyonun sonucu:
 {state.get('last_result', '')}
 
 Plan: {state.get('plan', '')}
+
+Son action/tool izi:
+{recent_trace}
 
 Mevcut adım: {state.get('current_step', 0)}
 Maksimum adım: {state.get('max_steps', 25)}
@@ -272,6 +393,12 @@ Değerlendir:
 1. Hata var mı?
 2. Plan tamamlandı mı?
 3. Bir sonraki adım ne olmalı?
+
+Karar kuralları:
+- Bir write_file başarılı olduysa ve doğrulama adımı (list_files/read_file) dosyayı gösteriyorsa "done" dön.
+- Aynı tool aynı amaçla tekrar ediyorsa ve yeni ilerleme yoksa "done" dön.
+- Sadece gerçekten yeni, gerekli bir adım varsa "continue" dön.
+- Sadece hata çözümü gerekiyorsa "fix" dön.
 
 CEVABINI ZORUNLU OLARAK AŞAĞIDAKİ EXACT JSON FORMATINDA VER:
 {{
@@ -458,7 +585,8 @@ async def _execute_tool(project_id: str, llm_response: str) -> str:
             return f"Dosya silindi: {args.get('path', '')}"
 
         elif tool_name == "list_files":
-            result = await client.list_files(args.get("directory", "/"))
+            target_dir = args.get("directory") or args.get("path") or "/"
+            result = await client.list_files(target_dir)
             files = result.get("files", [])
             return "\n".join(
                 item.get("name", str(item)) if isinstance(item, dict) else str(item)

@@ -39,6 +39,106 @@ from core.database import Database
 logger = structlog.get_logger(__name__)
 
 
+def _extract_tool_payload(raw: str) -> dict | None:
+    """Action JSON içeriğinden tool payload çıkar."""
+    import json
+    import re
+
+    clean = (raw or "").strip()
+    if not clean:
+        return None
+
+    match = re.search(r"```(?:json)?\s*({.*?})\s*```", clean, re.DOTALL)
+    if match:
+        clean = match.group(1).strip()
+    elif "{" in clean and "}" in clean:
+        start = clean.index("{")
+        end = clean.rindex("}") + 1
+        clean = clean[start:end]
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
+
+
+def _collect_action_events(messages: list[dict]) -> list[dict]:
+    """messages listesinden action/tool event çiftlerini çıkar."""
+    events: list[dict] = []
+
+    for msg in messages:
+        if msg.get("node") != "action":
+            continue
+
+        role = msg.get("role")
+        if role == "assistant":
+            payload = _extract_tool_payload(str(msg.get("content", "")))
+            if not payload:
+                continue
+            events.append({
+                "tool": str(payload.get("tool", "")).strip().lower(),
+                "args": payload.get("args", {}) or {},
+                "result": "",
+            })
+        elif role == "tool":
+            if events and not events[-1]["result"]:
+                events[-1]["result"] = str(msg.get("content", ""))
+
+    return events
+
+
+def _is_write_then_verify_completed(state: dict) -> bool:
+    """
+    write_file sonrası list_files/read_file ile doğrulama yapıldıysa tamamlandı kabul et.
+    """
+    events = _collect_action_events(state.get("messages", []))
+    if len(events) < 2:
+        return False
+
+    verify = events[-1]
+    write = events[-2]
+
+    if write.get("tool") != "write_file":
+        return False
+    if verify.get("tool") not in ("list_files", "read_file"):
+        return False
+
+    write_result = (write.get("result") or "").lower()
+    if "dosya yaz" not in write_result:
+        return False
+
+    path = str(write.get("args", {}).get("path", "")).strip()
+    if not path:
+        return False
+    filename = path.replace("\\", "/").split("/")[-1].lower()
+
+    verify_result = (verify.get("result") or "").lower()
+    if not verify_result:
+        return False
+
+    return filename in verify_result
+
+
+def _is_stalled_same_tool_loop(state: dict) -> bool:
+    """
+    Son 3 action aynı tool ve sonuçlarda yeni ilerleme yoksa loop kabul et.
+    """
+    events = _collect_action_events(state.get("messages", []))
+    if len(events) < 3:
+        return False
+
+    tail = events[-3:]
+    tools = {e.get("tool") for e in tail}
+    if len(tools) != 1:
+        return False
+
+    results = [(e.get("result") or "").strip().lower() for e in tail]
+    if any(("tool hatası" in r) or ("tool parse hatası" in r) for r in results):
+        return False
+
+    return len(set(results)) <= 1
+
+
 # ═══════════════════════════════════════════════════════
 # AGENT STATE
 # ═══════════════════════════════════════════════════════
@@ -155,9 +255,27 @@ def _should_continue(state: AgentState) -> str:
 
     if decision == "done":
         return "summary_updater"
-    else:
-        # "continue" veya "fix" → action'a dön
-        return "action"
+
+    # LLM kararı "continue/fix" olsa da write→verify tamamlandıysa bitir.
+    if _is_write_then_verify_completed(state):
+        logger.info(
+            "observer_forced_done_write_verified",
+            project_id=state.get("project_id"),
+            step=current_step,
+        )
+        return "summary_updater"
+
+    # Aynı tool çıktısında takılı döngüleri kısa kes.
+    if _is_stalled_same_tool_loop(state):
+        logger.warning(
+            "observer_forced_done_stalled_loop",
+            project_id=state.get("project_id"),
+            step=current_step,
+        )
+        return "summary_updater"
+
+    # "continue" veya "fix" → action'a dön
+    return "action"
 
 
 # ═══════════════════════════════════════════════════════
@@ -296,22 +414,7 @@ async def run_agent(
             for node_name, node_state in step_output.items():
                 final_state = {**final_state, **node_state}
 
-                # Step kaydını MongoDB'ye ekle
-                step_record = {
-                    "step_no": final_state.get("current_step", 0),
-                    "node": node_name,
-                    "action": final_state.get("last_action", "")[:500],
-                    "result": final_state.get("last_result", "")[:500],
-                    "timestamp": datetime.now(timezone.utc),
-                }
-
-                await db[AGENT_SESSIONS_COLLECTION].update_one(
-                    {"session_id": session_id},
-                    {"$push": {"steps": step_record}},
-                )
-
-                # Node'a göre doğru logu WebSocket'e gönderelim
-                # Observer ise observation'ı, değilse action'ı gösterelim
+                # Node'a göre doğru aksiyon metnini belirle (Mongo + WebSocket)
                 if node_name == "observer":
                     # ÖNEMLİ: state.get() değil node_state.get() kullanıyoruz
                     # Çünkü final_state eski "last_action" alanını ezmediği için karışıyor
@@ -320,9 +423,25 @@ async def run_agent(
                     display_action = node_state.get("plan", final_state.get("plan", ""))
                 elif node_name == "context_builder":
                     display_action = "Context oluşturuldu."
-                else: # action ve diğerleri
+                elif node_name == "summary_updater":
+                    display_action = "Özetler güncellendi."
+                else:  # action
                     # action_node, dict dönerken "last_action" key'ine kaydeder
                     display_action = node_state.get("last_action", final_state.get("last_action", ""))
+
+                # Step kaydını MongoDB'ye ekle
+                step_record = {
+                    "step_no": final_state.get("current_step", 0),
+                    "node": node_name,
+                    "action": display_action[:500],
+                    "result": final_state.get("last_result", "")[:500],
+                    "timestamp": datetime.now(timezone.utc),
+                }
+
+                await db[AGENT_SESSIONS_COLLECTION].update_one(
+                    {"session_id": session_id},
+                    {"$push": {"steps": step_record}},
+                )
 
                 # Callback (WebSocket bildirimi)
                 if on_step_callback:

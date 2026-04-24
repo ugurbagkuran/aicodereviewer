@@ -40,31 +40,30 @@ class SandboxClient:
             project_id: Hedef projenin ID'si.
         """
         self.project_id = project_id
-        self.base_url = self._build_sidecar_url(project_id)
+        self.base_url, self._extra_headers = self._build_sidecar_url(project_id)
         self.timeout = httpx.Timeout(
             timeout=settings.SIDECAR_TIMEOUT,
             connect=5.0,
         )
 
     @staticmethod
-    def _build_sidecar_url(project_id: str) -> str:
+    def _build_sidecar_url(project_id: str) -> tuple[str, dict]:
         """
-        Kubernetes internal DNS üzerinden sidecar URL'i oluştur.
+        Sidecar URL ve gerekli headers'ı döndür.
 
-        Format:
-          In-cluster:  http://{svc}.{ns}.svc.cluster.local:{port}
-          Out-cluster: http://localhost:{port}  (dev mode)
+        In-cluster:  Service DNS, port 80 (Service → pod:8000 → sidecar)
+        Dev (Minikube tunnel): http://127.0.0.1 + Host header → Ingress → Service
         """
         prefix = settings.K8S_NAMESPACE_PREFIX
-        port = settings.SIDECAR_PORT
 
         if settings.K8S_IN_CLUSTER:
             service = f"{prefix}{project_id}-svc"
             namespace = f"{prefix}{project_id}"
-            return f"http://{service}.{namespace}.svc.cluster.local:{port}"
+            return f"http://{service}.{namespace}.svc.cluster.local:80", {}
         else:
-            # Development: localhost stub
-            return f"http://localhost:{port}"
+            # Minikube tunnel + Ingress üzerinden erişim
+            host_header = f"{prefix}{project_id}.{settings.BASE_DOMAIN}"
+            return "http://127.0.0.1", {"Host": host_header}
 
     async def _request(
         self,
@@ -87,6 +86,11 @@ class SandboxClient:
             BadRequestException: Sidecar erişilemezse veya hata dönerse.
         """
         url = f"{self.base_url}{path}"
+
+        # Var olan headers ile extra headers'ı birleştir
+        if self._extra_headers:
+            existing = kwargs.pop("headers", {})
+            kwargs["headers"] = {**self._extra_headers, **existing}
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

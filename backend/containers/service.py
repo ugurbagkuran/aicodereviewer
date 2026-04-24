@@ -101,7 +101,7 @@ async def create_pod(
             name="sidecar",
             image="aicodereviewer-sidecar:latest",  # Dockerfile build alınmalı
             image_pull_policy="IfNotPresent",
-            ports=[client.V1ContainerPort(container_port=8000)],
+            ports=[client.V1ContainerPort(container_port=8000, name="sidecar-http")],
             volume_mounts=[client.V1VolumeMount(name="workspace", mount_path="/workspace")],
             resources=client.V1ResourceRequirements(
                 requests={
