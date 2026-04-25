@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="AI Code Reviewer Sidecar API")
@@ -60,17 +60,14 @@ def resolve_path(sandbox_path: str) -> Path:
 
 @app.get("/", response_class=HTMLResponse)
 async def preview_root() -> HTMLResponse:
-    """Preview kök URL'inde workspace/index.html içeriğini servis et."""
+    """Kök URL'de workspace/index.html servis et."""
     index_file = Path(WORKSPACE_DIR) / "index.html"
-
     if not index_file.exists() or not index_file.is_file():
         raise HTTPException(status_code=404, detail="index.html bulunamadı")
-
     try:
         content = index_file.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="index.html UTF-8 olmalı")
-
     return HTMLResponse(content=content)
 
 
@@ -220,3 +217,23 @@ async def restart_service() -> Dict:
         return {"success": True, "message": "Yeniden başlatma sinyali gönderildi."}
     except Exception as e:
         return {"success": False, "message": f"Hata: {str(e)}"}
+
+
+@app.get("/{path:path}")
+async def serve_static(path: str) -> FileResponse:
+    """Workspace içindeki herhangi bir statik dosyayı servis et.
+
+    /files, /exec gibi API route'ları daha spesifik olduğu için önce eşleşir;
+    geri kalan tüm yollar buraya düşer (CSS, JS, görsel vb.).
+    """
+    target = resolve_path(path)
+
+    if target.is_file():
+        return FileResponse(target)
+
+    if target.is_dir():
+        index = target / "index.html"
+        if index.is_file():
+            return FileResponse(index)
+
+    raise HTTPException(status_code=404, detail=f"Dosya bulunamadı: {path}")

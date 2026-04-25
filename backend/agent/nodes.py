@@ -27,20 +27,39 @@ _llm_instance = None
 
 def _get_llm():
     """
-    Google AI Studio üzerinden (Gemini vb.) model instance'ı.
+    AI_PROVIDER ayarına göre LLM instance döndürür.
+    "google"  → ChatGoogleGenerativeAI (Gemini vb.)
+    "openrouter" → ChatOpenAI uyumlu, OpenRouter base URL ile.
     """
     global _llm_instance
     if _llm_instance is not None:
         return _llm_instance
 
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    _llm_instance = ChatGoogleGenerativeAI(
-        model=settings.AI_MODEL,
-        google_api_key=settings.GOOGLE_API_KEY,
-        temperature=0.1,
-        max_tokens=8192,
-    )
+    provider = (settings.AI_PROVIDER or "google").lower().strip()
 
+    if provider == "openrouter":
+        from langchain_openai import ChatOpenAI
+        _llm_instance = ChatOpenAI(
+            model=settings.AI_MODEL,
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url=settings.OPENROUTER_BASE_URL,
+            temperature=0.1,
+            max_tokens=8192,
+            default_headers={
+                "HTTP-Referer": "https://github.com/ugurbagkuran/ai-code-reviewer",
+                "X-Title": "AI Code Reviewer",
+            },
+        )
+    else:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        _llm_instance = ChatGoogleGenerativeAI(
+            model=settings.AI_MODEL,
+            google_api_key=settings.GOOGLE_API_KEY,
+            temperature=0.1,
+            max_tokens=8192,
+        )
+
+    logger.info("llm_initialized", provider=provider, model=settings.AI_MODEL)
     return _llm_instance
 
 
@@ -221,14 +240,16 @@ async def planner_node(state: dict) -> dict:
     system_prompt = """Sen bir yazılım mühendisi AI agent'sın.
 Kullanıcının isteğini analiz et ve bir aksiyon planı oluştur.
 
-Kullanabileceğin araçlar:
+Kullanabileceğin araçlar (SADECE BUNLAR — başka tool YOK):
 - read_file(path): Dosya oku
-- write_file(path, content): Dosya yaz
+- write_file(path, content): Dosya yaz (dizin yoksa otomatik oluşturur, mkdir gerekmez)
 - delete_file(path): Dosya sil
 - list_files(directory): Dizin listele
 - run_command(command): Shell komutu çalıştır
 - restart_service(): Servisi yeniden başlat
 - get_logs(lines): Log oku
+
+NOT: create_directory, mkdir, touch gibi tool'lar YOKTUR. Dizin oluşturmak için write_file kullan.
 
 Kurallar:
 1. Önce mevcut kodu anla, sonra değişiklik yap.
@@ -241,8 +262,8 @@ Planını JSON formatında döndür:
 {
     "analysis": "İsteğin kısa analizi",
     "steps": [
-        {"action": "read_file", "target": "src/main.py", "reason": "Mevcut kodu anla"},
-        {"action": "write_file", "target": "src/utils.py", "reason": "Yardımcı fonksiyon ekle"},
+        {"action": "read_file", "path": "src/main.py", "reason": "Mevcut kodu anla"},
+        {"action": "write_file", "path": "src/utils.py", "reason": "Yardımcı fonksiyon ekle"},
         ...
     ]
 }"""
@@ -505,6 +526,94 @@ def _format_messages(messages: list[dict]) -> str:
     return "\n".join(lines) if lines else "(boş)"
 
 
+# ═══════════════════════════════════════════════════════
+# NODE 6: REVIEWER
+# ═══════════════════════════════════════════════════════
+
+
+async def reviewer_node(state: dict) -> dict:
+    """
+    Değiştirilen dosyaları code review'dan geçir.
+
+    summary_updater bittikten sonra çalışır.
+    Her yazılan dosyayı okur, LLM ile inceler,
+    yapılandırılmış bulgular (findings) üretir.
+    """
+    logger.info("node_reviewer", project_id=state["project_id"])
+
+    modified_files = _extract_modified_files(state.get("messages", []))
+    if not modified_files:
+        return {**state, "review_findings": [], "status": "completed"}
+
+    from sandbox.client import SandboxClient
+    from langchain_core.messages import HumanMessage as HM
+    client = SandboxClient(state["project_id"])
+    llm = _get_llm()
+
+    all_findings = []
+
+    for file_path in modified_files:
+        try:
+            result = await client.read_file(file_path)
+            content = result.get("content", "")
+            if not content:
+                continue
+
+            review_prompt = f"""Sen deneyimli bir code reviewer'sın. Aşağıdaki dosyayı incele.
+
+Dosya: {file_path}
+İçerik:
+```
+{content[:4000]}
+```
+
+Güvenlik açıkları, hatalar, kötü pratikler ve iyileştirme önerilerini bul.
+SADECE JSON listesi döndür, başka metin ekleme:
+
+[
+  {{
+    "severity": "error",
+    "line": 12,
+    "message": "XSS açığı — kullanıcı girdisi sanitize edilmemiş",
+    "suggestion": "innerHTML yerine textContent kullan"
+  }},
+  {{
+    "severity": "warning",
+    "line": 7,
+    "message": "meta viewport eksik",
+    "suggestion": "<meta name='viewport' content='width=device-width, initial-scale=1'> ekle"
+  }}
+]
+
+severity değerleri: "error" (kritik), "warning" (orta), "info" (öneri)
+Bulgu yoksa boş liste [] döndür."""
+
+            response = await llm.ainvoke([HM(content=review_prompt)])
+            raw = _extract_text(response.content).strip()
+
+            import json, re
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if match:
+                try:
+                    findings = json.loads(match.group(0))
+                    for f in findings:
+                        f["file"] = file_path
+                    all_findings.extend(findings)
+                except json.JSONDecodeError:
+                    pass
+
+        except Exception as e:
+            logger.warning("review_failed", file_path=file_path, error=str(e))
+
+    logger.info(
+        "reviewer_done",
+        project_id=state["project_id"],
+        findings=len(all_findings),
+    )
+
+    return {**state, "review_findings": all_findings, "status": "completed"}
+
+
 def _extract_modified_files(messages: list[dict]) -> list[str]:
     """
     Mesaj geçmişinden değiştirilen dosya yollarını çıkar.
@@ -568,24 +677,27 @@ async def _execute_tool(project_id: str, llm_response: str) -> str:
     from sandbox.client import SandboxClient
     client = SandboxClient(project_id)
 
+    def _path(a: dict) -> str:
+        """LLM bazen 'target', bazen 'path' kullanır — ikisini de kabul et."""
+        return a.get("path") or a.get("target") or ""
+
     try:
         if tool_name == "read_file":
-            result = await client.read_file(args.get("path", ""))
+            result = await client.read_file(_path(args))
             return result.get("content", "")
 
         elif tool_name == "write_file":
-            await client.write_file(
-                args.get("path", ""),
-                args.get("content", ""),
-            )
-            return f"Dosya yazıldı: {args.get('path', '')}"
+            p = _path(args)
+            await client.write_file(p, args.get("content", ""))
+            return f"Dosya yazıldı: {p}"
 
         elif tool_name == "delete_file":
-            await client.delete_file(args.get("path", ""))
-            return f"Dosya silindi: {args.get('path', '')}"
+            p = _path(args)
+            await client.delete_file(p)
+            return f"Dosya silindi: {p}"
 
         elif tool_name == "list_files":
-            target_dir = args.get("directory") or args.get("path") or "/"
+            target_dir = args.get("directory") or _path(args) or "/"
             result = await client.list_files(target_dir)
             files = result.get("files", [])
             return "\n".join(

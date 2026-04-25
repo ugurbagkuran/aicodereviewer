@@ -54,7 +54,8 @@ async def test_agent():
                 data = json.loads(response)
                 
                 if data["type"] == "step":
-                    print(f"[{data['step_no']}] Node: {data['node']} => Islem: {data['action'][:100]}...")
+                    action = data['action']
+                    print(f"[{data['step_no']}] Node: {data['node']} =>\n{action}\n")
                 elif data["type"] == "complete":
                     print("\n--- Agent gorevini basariyla tamamladi! ---")
                     break

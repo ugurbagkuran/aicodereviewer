@@ -417,10 +417,11 @@ async def start_project(
     if doc["status"] not in (
         ProjectStatus.CREATED.value,
         ProjectStatus.STOPPED.value,
+        ProjectStatus.ERROR.value,
     ):
         raise BadRequestException(
             f"Proje '{doc['status']}' durumunda. "
-            f"Sadece 'created' veya 'stopped' durumundaki projeler başlatılabilir."
+            f"Sadece 'created', 'stopped' veya 'error' durumundaki projeler başlatılabilir."
         )
 
     # Kapasite kontrolleri
